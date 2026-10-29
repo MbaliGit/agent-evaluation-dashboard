@@ -1,12 +1,27 @@
+import os
 import time
 from difflib import SequenceMatcher
 from textwrap import dedent
 
-import ollama
+import httpx
 import pandas as pd
 import streamlit as st
 
-MODEL = "llama3"
+try:
+    import ollama  # only needed when running locally
+except ImportError:
+    ollama = None
+
+OLLAMA_MODEL = "llama3"
+GROQ_MODEL_DEFAULT = "llama-3.1-8b-instant"
+
+
+def get_secret(name, default=None):
+    try:
+        return st.secrets[name]
+    except Exception:
+        return os.environ.get(name, default)
+
 
 # ---------- Evaluation data ----------
 eval_data = pd.DataFrame({
@@ -29,18 +44,43 @@ eval_data = pd.DataFrame({
         "An AI agent can reason about a task and use tools to take actions.",
     ],
 })
-eval_data.to_csv("evaluation_dataset.csv", index=False)
 
 
-# ---------- Model----------
+# ---------- Model backends ----------
+def groq_chat(prompt, api_key):
+    resp = httpx.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers={"Authorization": f"Bearer {api_key}"},
+        json={
+            "model": get_secret("GROQ_MODEL", GROQ_MODEL_DEFAULT),
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0,
+        },
+        timeout=60,
+    )
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"]
+
+
 def local_model(prompt):
+    """Hosted model (Groq) if GROQ_API_KEY is set, otherwise local Ollama."""
+    api_key = get_secret("GROQ_API_KEY")
+    if api_key:
+        return groq_chat(prompt, api_key)
+
+    if ollama is None:
+        raise RuntimeError(
+            "No model backend available. Set GROQ_API_KEY in your secrets, "
+            "or install ollama and run it locally."
+        )
     response = ollama.chat(
-        model=MODEL,
+        model=OLLAMA_MODEL,
         messages=[{"role": "user", "content": prompt}],
     )
     return response["message"]["content"]
 
 
+# ---------- App under test ----------
 def llm_application(question, context, prompt_version="v1"):
     if prompt_version == "v1":
         prompt = dedent(f"""\
@@ -95,20 +135,30 @@ def evaluate_prompt(prompt_version):
     return pd.DataFrame(results)
 
 
+# Cached so Streamlit doesn't re-call the model on every rerun.
+# Exceptions are not cached, so a failed run is retried next time.
 @st.cache_data(show_spinner="Running evaluation...")
 def run_comparison():
-    comparison = pd.concat(
+    return pd.concat(
         [evaluate_prompt("v1"), evaluate_prompt("v2")],
         ignore_index=True,
     )
-    comparison.to_csv("evaluation_results.csv", index=False)
-    return comparison
 
 
 # ---------- Dashboard ----------
 st.title("LLM Evaluation Dashboard")
 
-comparison = run_comparison()
+try:
+    comparison = run_comparison()
+except Exception as e:
+    st.error(
+        "Couldn't reach a language model.\n\n"
+        "- On Streamlit Cloud: add `GROQ_API_KEY` under App settings → Secrets.\n"
+        "- Locally: make sure Ollama is running and `ollama pull llama3` is done.\n\n"
+        f"Details: `{type(e).__name__}: {e}`"
+    )
+    st.stop()
+
 by_prompt = comparison.groupby("prompt")[["quality", "latency"]].mean()
 
 col1, col2 = st.columns(2)
